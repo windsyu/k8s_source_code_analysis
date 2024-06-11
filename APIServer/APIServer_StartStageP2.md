@@ -14,6 +14,8 @@ apiserver中包含3个server组件，apiserver依靠这3个组件来对不同类
 
 # 启动流程
 
+![img](assets/apiserver_start.png)
+
 ## Cobro参数解析
 
 APIServer命令行参数解析通过`cmd/kube-apiserver/app/server.go`中`func NewAPIServerCommand()`实现，通过RunE中的return位置跳转到Run函数。
@@ -46,7 +48,7 @@ RunE: func(cmd *cobra.Command, args []string) error {
 		},
 ```
 
-## Run函数
+# Run函数是主函数
 
 run函数执行3件事情：
 
@@ -62,7 +64,7 @@ func Run(ctx context.Context, opts options.CompletedOptions) error {
 	klog.Infof("Version: %+v", version.Get())
 
 	klog.InfoS("Golang settings", "GOGC", os.Getenv("GOGC"), "GOMAXPROCS", os.Getenv("GOMAXPROCS"), "GOTRACEBACK", os.Getenv("GOTRACEBACK"))
-
+	//写配置
 	config, err := NewConfig(opts)
 	if err != nil {
 		return err
@@ -71,7 +73,7 @@ func Run(ctx context.Context, opts options.CompletedOptions) error {
 	if err != nil {
 		return err
 	}
-    //注册三个server的路由
+    //注册server的路由，做好配置，但是没有启动
 	server, err := CreateServerChain(completed)
 	if err != nil {
 		return err
@@ -85,6 +87,165 @@ func Run(ctx context.Context, opts options.CompletedOptions) error {
 	return prepared.Run(ctx)
 }
 ```
+
+> cmd/kube-apiserver/app/config.go---func NewConfig(opts options.CompletedOptions) (*Config, error)
+>
+> cmd/kube-apiserver/app/config.go---func (c *Config) Complete() (CompletedConfig, error)
+>
+> cmd/kube-apiserver/app/server.go---func CreateServerChain(config CompletedConfig) (*aggregatorapiserver.APIAggregator, error)
+>
+> vendor/k8s.io/kube-aggregator/pkg/apiserver/apiserver.go---func (s *APIAggregator) PrepareRun() (preparedAPIAggregator, error)
+
+
+
+## 
+
+## Config资源的创建
+
+
+
+```go
+// cmd/kube-apiserver/app/config.go:74
+// NewConfig creates all the resources for running kube-apiserver, but runs none of them.
+func NewConfig(opts options.CompletedOptions)(*Config, error){
+    c :=&Config{
+        Options: opts,
+    }
+    //genericConfig, versionedInformers, storageFactory在CreateKubeAPIServerConfig函数中被使用
+	genericConfig, versionedInformers, storageFactory, err := controlplaneapiserver.BuildGenericConfig(
+		opts.CompletedOptions,
+		[]*runtime.Scheme{legacyscheme.Scheme, apiextensionsapiserver.Scheme, aggregatorscheme.Scheme},
+		controlplane.DefaultAPIResourceConfigSource(),
+		generatedopenapi.GetOpenAPIDefinitions,
+	)
+    	if err != nil {
+		return nil, err
+	}
+	//KubeAPIs中包含apiExtensions和aggregator中需要的很多依赖
+	kubeAPIs, serviceResolver, pluginInitializer, err := CreateKubeAPIServerConfig(opts, genericConfig, versionedInformers, storageFactory)
+	if err != nil {
+		return nil, err
+	}
+	c.KubeAPIs = kubeAPIs
+
+	apiExtensions, err := controlplaneapiserver.CreateAPIExtensionsConfig(*kubeAPIs.ControlPlane.Generic, kubeAPIs.ControlPlane.VersionedInformers, pluginInitializer, opts.CompletedOptions, opts.MasterCount,
+		serviceResolver, webhook.NewDefaultAuthenticationInfoResolverWrapper(kubeAPIs.ControlPlane.ProxyTransport, kubeAPIs.ControlPlane.Generic.EgressSelector, kubeAPIs.ControlPlane.Generic.LoopbackClientConfig, kubeAPIs.ControlPlane.Generic.TracerProvider))
+	if err != nil {
+		return nil, err
+	}
+	c.ApiExtensions = apiExtensions
+
+	aggregator, err := controlplaneapiserver.CreateAggregatorConfig(*kubeAPIs.ControlPlane.Generic, opts.CompletedOptions, kubeAPIs.ControlPlane.VersionedInformers, serviceResolver, kubeAPIs.ControlPlane.ProxyTransport, kubeAPIs.ControlPlane.Extra.PeerProxy, pluginInitializer)
+	if err != nil {
+		return nil, err
+	}
+	c.Aggregator = aggregator
+
+	return c, nil
+}
+
+
+```
+
+```go
+//cmd/kube-apiserver/app/config.go：74
+//CreateKubeAPIServerConfig creates all the resources for running the API server, but runs none of them
+func CreateKubeAPIServerConfig(
+	opts options.CompletedOptions,
+	genericConfig *genericapiserver.Config,
+	versionedInformers clientgoinformers.SharedInformerFactory,
+	storageFactory *serverstorage.DefaultStorageFactory,
+) (
+	*controlplane.Config,
+	aggregatorapiserver.ServiceResolver,
+	[]admission.PluginInitializer,
+	error,
+){
+	// global stuff
+	capabilities.Setup(opts.AllowPrivileged, opts.MaxConnectionBytesPerSec)
+
+	// additional admission initializers
+	kubeAdmissionConfig := &kubeapiserveradmission.Config{
+		CloudConfigFile: opts.CloudProvider.CloudConfigFile,
+	}
+	kubeInitializers, err := kubeAdmissionConfig.New()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to create admission plugin initializer: %w", err)
+	}
+
+	serviceResolver := buildServiceResolver(opts.EnableAggregatorRouting, genericConfig.LoopbackClientConfig.Host, versionedInformers)
+	controlplaneConfig, admissionInitializers, err := controlplaneapiserver.CreateConfig(opts.CompletedOptions, genericConfig, versionedInformers, storageFactory, serviceResolver, kubeInitializers)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	config := &controlplane.Config{
+		ControlPlane: *controlplaneConfig,
+		Extra: controlplane.Extra{
+			KubeletClientConfig: opts.KubeletConfig,
+
+			ServiceIPRange:          opts.PrimaryServiceClusterIPRange,
+			APIServerServiceIP:      opts.APIServerServiceIP,
+			SecondaryServiceIPRange: opts.SecondaryServiceClusterIPRange,
+
+			APIServerServicePort: 443,
+
+			ServiceNodePortRange:      opts.ServiceNodePortRange,
+			KubernetesServiceNodePort: opts.KubernetesServiceNodePort,
+
+			EndpointReconcilerType: reconcilers.Type(opts.EndpointReconcilerType),
+			MasterCount:            opts.MasterCount,
+		},
+	}
+
+	if config.ControlPlane.Generic.EgressSelector != nil {
+		// Use the config.ControlPlane.Generic.EgressSelector lookup to find the dialer to connect to the kubelet
+		config.Extra.KubeletClientConfig.Lookup = config.ControlPlane.Generic.EgressSelector.Lookup
+
+		// Use the config.ControlPlane.Generic.EgressSelector lookup as the transport used by the "proxy" subresources.
+		networkContext := egressselector.Cluster.AsNetworkContext()
+		dialer, err := config.ControlPlane.Generic.EgressSelector.Lookup(networkContext)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		c := config.ControlPlane.Extra.ProxyTransport.Clone()
+		c.DialContext = dialer
+		config.ControlPlane.ProxyTransport = c
+	}
+
+	return config, serviceResolver, admissionInitializers, nil    
+}
+```
+
+
+
+```go
+func buildServiceResolver(enabledAggregatorRouting bool, hostname string, informer clientgoinformers.SharedInformerFactory) webhook.ServiceResolver {
+	if testServiceResolver != nil {
+		return testServiceResolver
+	}
+
+	var serviceResolver webhook.ServiceResolver
+	if enabledAggregatorRouting {
+		serviceResolver = aggregatorapiserver.NewEndpointServiceResolver(
+			informer.Core().V1().Services().Lister(),
+			informer.Core().V1().Endpoints().Lister(),
+		)
+	} else {
+		serviceResolver = aggregatorapiserver.NewClusterIPServiceResolver(
+			informer.Core().V1().Services().Lister(),
+		)
+	}
+
+	// resolve kubernetes.default.svc locally
+	if localHost, err := url.Parse(hostname); err == nil {
+		serviceResolver = aggregatorapiserver.NewLoopbackServiceResolver(serviceResolver, localHost)
+	}
+	return serviceResolver
+}
+```
+
+
 
 ## 三个server的创建流程
 
@@ -119,3 +280,30 @@ func CreateServerChain(config CompletedConfig) (*aggregatorapiserver.APIAggregat
 }
 ```
 
+### APIExtensionServer
+
+主要负责处理CRD方面的请求
+
+1. 动态注册和管理CRD
+2. CRD资源的验证和转化
+3. 与KubeAPIServer的集成，动态扩展CRD资源并使用K8sAPI进行操作等等（例如kubectl操作）
+
+### KubeAPIServer
+
+负责处理K8s内置资源的请求，还包括通用处理，认证，鉴权等
+
+1. K8s内置资源相关的API请求唯一入口点。
+2. 和etcd集群进行交互 write&read
+3. 对Kubernetes API请求进行授权和认证，授权规则存储在etcd中，由集群管理员统一管理和配置
+4. 资源管理和操作
+5. Watch&Informer
+
+### AggregatorServer
+
+1. 聚合和代理来自不同APIServer的请求，为K8s提供一个统一的API入口点，而不是直接访问哥哥独立的APIServer
+2. 动态的API注册和发现：动态地扩展新的API资源，无需修改客户端代码
+3. API请求的访问控制，授权规则独立配置和管理，之后转发到不同的APIServer上再进行授权和认证
+4. 多个APIServer的负载均衡
+5. 监控和日志记录
+
+## 
