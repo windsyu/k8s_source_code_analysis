@@ -95,14 +95,24 @@ func Run(ctx context.Context, opts options.CompletedOptions) error {
 > cmd/kube-apiserver/app/server.go---func CreateServerChain(config CompletedConfig) (*aggregatorapiserver.APIAggregator, error)
 >
 > vendor/k8s.io/kube-aggregator/pkg/apiserver/apiserver.go---func (s *APIAggregator) PrepareRun() (preparedAPIAggregator, error)
+>
+> vendor/k8s.io/kube-aggregator/pkg/apiserver/apiserver.go---func (s preparedAPIAggregator) Run(ctx context.Context)
 
 
 
-## 
-
-## Config资源的创建
 
 
+## APIServer的配置参数初始化
+
+APIServer的配置参数比较多，大致做以下分类：
+
+- genericConfig，通用配置，三个Server都会使用
+- OpenAPI配置
+- Storage（ETCD）配置
+- Authentication认证配置
+- Authorization授权配置
+
+### genericConfig
 
 ```go
 // cmd/kube-apiserver/app/config.go:74
@@ -147,103 +157,123 @@ func NewConfig(opts options.CompletedOptions)(*Config, error){
 
 ```
 
-```go
-//cmd/kube-apiserver/app/config.go：74
-//CreateKubeAPIServerConfig creates all the resources for running the API server, but runs none of them
-func CreateKubeAPIServerConfig(
-	opts options.CompletedOptions,
-	genericConfig *genericapiserver.Config,
-	versionedInformers clientgoinformers.SharedInformerFactory,
-	storageFactory *serverstorage.DefaultStorageFactory,
-) (
-	*controlplane.Config,
-	aggregatorapiserver.ServiceResolver,
-	[]admission.PluginInitializer,
-	error,
-){
-	// global stuff
-	capabilities.Setup(opts.AllowPrivileged, opts.MaxConnectionBytesPerSec)
+### OpenAPI配置
 
-	// additional admission initializers
-	kubeAdmissionConfig := &kubeapiserveradmission.Config{
-		CloudConfigFile: opts.CloudProvider.CloudConfigFile,
-	}
-	kubeInitializers, err := kubeAdmissionConfig.New()
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to create admission plugin initializer: %w", err)
-	}
+Kubernetes 支持将其 API 的描述以 OpenAPI v3 形式发布。
 
-	serviceResolver := buildServiceResolver(opts.EnableAggregatorRouting, genericConfig.LoopbackClientConfig.Host, versionedInformers)
-	controlplaneConfig, admissionInitializers, err := controlplaneapiserver.CreateConfig(opts.CompletedOptions, genericConfig, versionedInformers, storageFactory, serviceResolver, kubeInitializers)
-	if err != nil {
-		return nil, nil, nil, err
-	}
+APIServer会动态地生成OpenAPI的定义文件，描述集群中的所有API资源和操作；由OpenAPI服务器提供访问，OpenAPIServer从APIServer获取最新的OpenAPI 定义，并通过HTTP服务的方式对外提供定义文件。
 
-	config := &controlplane.Config{
-		ControlPlane: *controlplaneConfig,
-		Extra: controlplane.Extra{
-			KubeletClientConfig: opts.KubeletConfig,
+当客户端需要获取 Kubernetes 集群的 OpenAPI 定义时,会向 OpenAPI 服务器发送请求。
+OpenAPI 服务器收到请求后,会查找缓存或直接从 API 服务器拉取最新的 OpenAPI 定义,并返回给客户端。
 
-			ServiceIPRange:          opts.PrimaryServiceClusterIPRange,
-			APIServerServiceIP:      opts.APIServerServiceIP,
-			SecondaryServiceIPRange: opts.SecondaryServiceClusterIPRange,
+OpenAPI服务器一般会同时部署v2和v3版本，v3可以提供更完整的API信息。
 
-			APIServerServicePort: 443,
+基本信息
 
-			ServiceNodePortRange:      opts.ServiceNodePortRange,
-			KubernetesServiceNodePort: opts.KubernetesServiceNodePort,
+```yaml
+openapi: 3.0.0
+info:
+  title: Kubernetes API
+  version: v1.23.0
+```
 
-			EndpointReconcilerType: reconcilers.Type(opts.EndpointReconcilerType),
-			MasterCount:            opts.MasterCount,
-		},
-	}
+服务器信息
 
-	if config.ControlPlane.Generic.EgressSelector != nil {
-		// Use the config.ControlPlane.Generic.EgressSelector lookup to find the dialer to connect to the kubelet
-		config.Extra.KubeletClientConfig.Lookup = config.ControlPlane.Generic.EgressSelector.Lookup
+```yaml
+servers:
+- url: https://kubernetes.default.svc
+  description: The default API server
+```
 
-		// Use the config.ControlPlane.Generic.EgressSelector lookup as the transport used by the "proxy" subresources.
-		networkContext := egressselector.Cluster.AsNetworkContext()
-		dialer, err := config.ControlPlane.Generic.EgressSelector.Lookup(networkContext)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		c := config.ControlPlane.Extra.ProxyTransport.Clone()
-		c.DialContext = dialer
-		config.ControlPlane.ProxyTransport = c
-	}
+API路径和HTTP方法，请求参数和响应结构和内容
 
-	return config, serviceResolver, admissionInitializers, nil    
-}
+```yaml
+paths:
+  /api/v1/namespaces:
+    get:
+      summary: list or watch objects of kind Namespace
+      parameters:
+      - name: fieldSelector
+        in: query
+        schema:
+          type: string
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/V1NamespaceList'
+  /api/v1/namespaces/{name}:
+    get:
+      summary: read the specified Namespace
+      parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/V1Namespace'
+```
+
+API的数据模型：
+
+```yaml
+components:
+  schemas:
+    V1Namespace:
+      type: object
+      properties:
+        apiVersion:
+          type: string
+        kind:
+          type: string
+        metadata:
+          $ref: '#/components/schemas/V1ObjectMeta'
+        spec:
+          $ref: '#/components/schemas/V1NamespaceSpec'
+        status:
+          $ref: '#/components/schemas/V1NamespaceStatus'
 ```
 
 
 
+### Storage（etcd）配置
+
+> pkg/controlplane/apiserver/config.go：187
+
 ```go
-func buildServiceResolver(enabledAggregatorRouting bool, hostname string, informer clientgoinformers.SharedInformerFactory) webhook.ServiceResolver {
-	if testServiceResolver != nil {
-		return testServiceResolver
-	}
+//配置	
+storageFactoryConfig := kubeapiserver.NewStorageFactoryConfig()
 
-	var serviceResolver webhook.ServiceResolver
-	if enabledAggregatorRouting {
-		serviceResolver = aggregatorapiserver.NewEndpointServiceResolver(
-			informer.Core().V1().Services().Lister(),
-			informer.Core().V1().Endpoints().Lister(),
-		)
-	} else {
-		serviceResolver = aggregatorapiserver.NewClusterIPServiceResolver(
-			informer.Core().V1().Services().Lister(),
-		)
-	}
-
-	// resolve kubernetes.default.svc locally
-	if localHost, err := url.Parse(hostname); err == nil {
-		serviceResolver = aggregatorapiserver.NewLoopbackServiceResolver(serviceResolver, localHost)
-	}
-	return serviceResolver
-}
+storageFactoryConfig.APIResourceConfig = genericConfig.MergedResourceConfig
+//实例化	
+storageFactory, lastErr = storageFactoryConfig.Complete(s.Etcd).New()
 ```
+
+定义了etcd的地址、认证、存储路径的prefix等信息后实例化了etcd storage对象。
+
+
+
+### 认证配置
+
+APIServer支持如下的认证策略：
+
+- X509 Client Certs
+- Static Token File
+- Bootstrap Tokens
+- Service Account Tokens
+- OpenID Connect Tokens（OIDC）
+- Webhook Token Authentication
+- Authenticating Proxy
+
+
 
 
 
