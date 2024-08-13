@@ -273,7 +273,255 @@ APIServer支持如下的认证策略：
 - Webhook Token Authentication
 - Authenticating Proxy
 
+```go
+//pkg/controlplane/apiserver/config.go:208	
+genericConfig.Authorization.Authorizer, genericConfig.RuleResolver, enablesRBAC, err = BuildAuthorizer(
+		ctx,
+		s,
+		genericConfig.EgressSelector,
+		genericConfig.APIServerID,
+		versionedInformers,
+	)
+```
 
+一系列的Authenticator认证在New（）函数中实例化
+
+> pkg/kubeapiserver/authenticator/config.go
+
+```go
+func (config Config) New(serverLifecycle context.Context) (authenticator.Request, func(context.Context, *apiserver.AuthenticationConfiguration) error, *spec.SecurityDefinitions, spec3.SecuritySchemes, error) {
+	var authenticators []authenticator.Request
+	var tokenAuthenticators []authenticator.Token
+	securityDefinitionsV2 := spec.SecurityDefinitions{}
+	securitySchemesV3 := spec3.SecuritySchemes{}
+
+	// front-proxy, BasicAuth methods, local first, then remote
+	// Add the front proxy authenticator if requested
+	if config.RequestHeaderConfig != nil {
+		requestHeaderAuthenticator := headerrequest.NewDynamicVerifyOptionsSecure(
+			config.RequestHeaderConfig.CAContentProvider.VerifyOptions,
+			config.RequestHeaderConfig.AllowedClientNames,
+			config.RequestHeaderConfig.UsernameHeaders,
+			config.RequestHeaderConfig.GroupHeaders,
+			config.RequestHeaderConfig.ExtraHeaderPrefixes,
+		)
+		authenticators = append(authenticators, authenticator.WrapAudienceAgnosticRequest(config.APIAudiences, requestHeaderAuthenticator))
+	}
+
+	// X509 methods
+	if config.ClientCAContentProvider != nil {
+		certAuth := x509.NewDynamic(config.ClientCAContentProvider.VerifyOptions, x509.CommonNameUserConversion)
+		authenticators = append(authenticators, certAuth)
+	}
+
+	// Bearer token methods, local first, then remote
+	if len(config.TokenAuthFile) > 0 {
+		tokenAuth, err := newAuthenticatorFromTokenFile(config.TokenAuthFile)
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
+		tokenAuthenticators = append(tokenAuthenticators, authenticator.WrapAudienceAgnosticToken(config.APIAudiences, tokenAuth))
+	}
+	if len(config.ServiceAccountKeyFiles) > 0 {
+		serviceAccountAuth, err := newLegacyServiceAccountAuthenticator(config.ServiceAccountKeyFiles, config.ServiceAccountLookup, config.APIAudiences, config.ServiceAccountTokenGetter, config.SecretsWriter)
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
+		tokenAuthenticators = append(tokenAuthenticators, serviceAccountAuth)
+	}
+	if len(config.ServiceAccountIssuers) > 0 {
+		serviceAccountAuth, err := newServiceAccountAuthenticator(config.ServiceAccountIssuers, config.ServiceAccountKeyFiles, config.APIAudiences, config.ServiceAccountTokenGetter)
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
+		tokenAuthenticators = append(tokenAuthenticators, serviceAccountAuth)
+	}
+
+	if config.BootstrapToken && config.BootstrapTokenAuthenticator != nil {
+		tokenAuthenticators = append(tokenAuthenticators, authenticator.WrapAudienceAgnosticToken(config.APIAudiences, config.BootstrapTokenAuthenticator))
+	}
+
+	// NOTE(ericchiang): Keep the OpenID Connect after Service Accounts.
+	//
+	// Because both plugins verify JWTs whichever comes first in the union experiences
+	// cache misses for all requests using the other. While the service account plugin
+	// simply returns an error, the OpenID Connect plugin may query the provider to
+	// update the keys, causing performance hits.
+	var updateAuthenticationConfig func(context.Context, *apiserver.AuthenticationConfiguration) error
+	if config.AuthenticationConfig != nil {
+		initialJWTAuthenticator, err := newJWTAuthenticator(serverLifecycle, config.AuthenticationConfig, config.OIDCSigningAlgs, config.APIAudiences, config.ServiceAccountIssuers)
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
+
+		jwtAuthenticatorPtr := &atomic.Pointer[jwtAuthenticatorWithCancel]{}
+		jwtAuthenticatorPtr.Store(initialJWTAuthenticator)
+
+		updateAuthenticationConfig = (&authenticationConfigUpdater{
+			serverLifecycle:     serverLifecycle,
+			config:              config,
+			jwtAuthenticatorPtr: jwtAuthenticatorPtr,
+		}).updateAuthenticationConfig
+
+		tokenAuthenticators = append(tokenAuthenticators,
+			authenticator.TokenFunc(func(ctx context.Context, token string) (*authenticator.Response, bool, error) {
+				return jwtAuthenticatorPtr.Load().jwtAuthenticator.AuthenticateToken(ctx, token)
+			}),
+		)
+	}
+
+	if len(config.WebhookTokenAuthnConfigFile) > 0 {
+		webhookTokenAuth, err := newWebhookTokenAuthenticator(config)
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
+
+		tokenAuthenticators = append(tokenAuthenticators, webhookTokenAuth)
+	}
+
+	if len(tokenAuthenticators) > 0 {
+		// Union the token authenticators
+		tokenAuth := tokenunion.New(tokenAuthenticators...)
+		// Optionally cache authentication results
+		if config.TokenSuccessCacheTTL > 0 || config.TokenFailureCacheTTL > 0 {
+			tokenAuth = tokencache.New(tokenAuth, true, config.TokenSuccessCacheTTL, config.TokenFailureCacheTTL)
+		}
+		authenticators = append(authenticators, bearertoken.New(tokenAuth), websocket.NewProtocolAuthenticator(tokenAuth))
+
+		securityDefinitionsV2["BearerToken"] = &spec.SecurityScheme{
+			SecuritySchemeProps: spec.SecuritySchemeProps{
+				Type:        "apiKey",
+				Name:        "authorization",
+				In:          "header",
+				Description: "Bearer Token authentication",
+			},
+		}
+		securitySchemesV3["BearerToken"] = &spec3.SecurityScheme{
+			SecuritySchemeProps: spec3.SecuritySchemeProps{
+				Type:        "apiKey",
+				Name:        "authorization",
+				In:          "header",
+				Description: "Bearer Token authentication",
+			},
+		}
+	}
+
+	if len(authenticators) == 0 {
+		if config.Anonymous {
+			return anonymous.NewAuthenticator(), nil, &securityDefinitionsV2, securitySchemesV3, nil
+		}
+		return nil, nil, &securityDefinitionsV2, securitySchemesV3, nil
+	}
+
+	authenticator := union.New(authenticators...)
+
+	authenticator = group.NewAuthenticatedGroupAdder(authenticator)
+
+	if config.Anonymous {
+		// If the authenticator chain returns an error, return an error (don't consider a bad bearer token
+		// or invalid username/password combination anonymous).
+		authenticator = union.NewFailOnError(authenticator, anonymous.NewAuthenticator())
+	}
+
+	return authenticator, updateAuthenticationConfig, &securityDefinitionsV2, securitySchemesV3, nil
+}
+```
+
+每一种认证协议都启动一个对应的认证器。当认证请求进来时，便利各个认证器，只要有一个认证器返回true则视为认证成功，全部为false则认证失败。
+
+### 授权配置
+
+授权配置的流程与认证配置基本一致：
+
+APIServer支持如下的授权策略：
+
+- AlwaysAllow
+- AlwaysDeny
+- webhook授权
+- node授权
+- ABAC授权
+- RBAC授权
+
+
+
+> pkg/kubeapiserver/authorizer/config.go：75
+
+```go
+func (config Config) New(ctx context.Context, serverID string) (authorizer.Authorizer, authorizer.RuleResolver, error) {
+	if len(config.AuthorizationConfiguration.Authorizers) == 0 {
+		return nil, nil, fmt.Errorf("at least one authorization mode must be passed")
+	}
+
+	r := &reloadableAuthorizerResolver{
+		initialConfig:    config,
+		apiServerID:      serverID,
+		lastLoadedConfig: config.AuthorizationConfiguration,
+		reloadInterval:   time.Minute,
+	}
+
+	seenTypes := sets.New[authzconfig.AuthorizerType]()
+
+	// Build and store authorizers which will persist across reloads
+	for _, configuredAuthorizer := range config.AuthorizationConfiguration.Authorizers {
+		seenTypes.Insert(configuredAuthorizer.Type)
+
+		// Keep cases in sync with constant list in k8s.io/kubernetes/pkg/kubeapiserver/authorizer/modes/modes.go.
+		switch configuredAuthorizer.Type {
+		case authzconfig.AuthorizerType(modes.ModeNode):
+			var slices resourcev1alpha2informers.ResourceSliceInformer
+			if utilfeature.DefaultFeatureGate.Enabled(features.DynamicResourceAllocation) {
+				slices = config.VersionedInformerFactory.Resource().V1alpha2().ResourceSlices()
+			}
+			node.RegisterMetrics()
+			graph := node.NewGraph()
+			node.AddGraphEventHandlers(
+				graph,
+				config.VersionedInformerFactory.Core().V1().Nodes(),
+				config.VersionedInformerFactory.Core().V1().Pods(),
+				config.VersionedInformerFactory.Core().V1().PersistentVolumes(),
+				config.VersionedInformerFactory.Storage().V1().VolumeAttachments(),
+				slices, // Nil check in AddGraphEventHandlers can be removed when always creating this.
+			)
+			r.nodeAuthorizer = node.NewAuthorizer(graph, nodeidentifier.NewDefaultNodeIdentifier(), bootstrappolicy.NodeRules())
+
+		case authzconfig.AuthorizerType(modes.ModeABAC):
+			var err error
+			r.abacAuthorizer, err = abac.NewFromFile(config.PolicyFile)
+			if err != nil {
+				return nil, nil, err
+			}
+		case authzconfig.AuthorizerType(modes.ModeRBAC):
+			r.rbacAuthorizer = rbac.New(
+				&rbac.RoleGetter{Lister: config.VersionedInformerFactory.Rbac().V1().Roles().Lister()},
+				&rbac.RoleBindingLister{Lister: config.VersionedInformerFactory.Rbac().V1().RoleBindings().Lister()},
+				&rbac.ClusterRoleGetter{Lister: config.VersionedInformerFactory.Rbac().V1().ClusterRoles().Lister()},
+				&rbac.ClusterRoleBindingLister{Lister: config.VersionedInformerFactory.Rbac().V1().ClusterRoleBindings().Lister()},
+			)
+		}
+	}
+
+	// Require all non-webhook authorizer types to remain specified in the file on reload
+	seenTypes.Delete(authzconfig.TypeWebhook)
+	r.requireNonWebhookTypes = seenTypes
+
+	// Construct the authorizers / ruleResolvers for the given configuration
+	authorizer, ruleResolver, err := r.newForConfig(r.initialConfig.AuthorizationConfiguration)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	r.current.Store(&authorizerResolver{
+		authorizer:   authorizer,
+		ruleResolver: ruleResolver,
+	})
+
+	if r.initialConfig.ReloadFile != "" {
+		go r.runReload(ctx)
+	}
+
+	return r, r, nil
+}
+```
 
 
 
